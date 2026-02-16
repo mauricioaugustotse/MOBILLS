@@ -1,0 +1,13 @@
+.env
+Chave Secreta API_Mauricio_local.txt
+Chave_secreta_Perplexity.txt
+CHAVE_SECRETA_API_Mauricio_local.txt
+Chave_API_Perplexity.txt
+# Arquivos locais de chaves de API (variações de nome/capitalização)
+[Cc][Hh][Aa][Vv][Ee]*[Pp]erplexity*.txt
+[Cc][Hh][Aa][Vv][Ee]*[Aa][Pp][Ii]*[Mm]auricio*local*.txt
+[Cc][Hh][Aa][Vv][Ee]*[Aa][Pp][Ii]*[Cc]hat[Gg][Pp][Tt]*.txt
+[Cc][Hh][Aa][Vv][Ee]*[Aa][Pp][Ii]*[Oo]pen[Aa][Ii]*.txt
+__pycache__/
+.vscode/
+.venv/
