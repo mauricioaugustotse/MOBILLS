@@ -14,6 +14,8 @@ Regras desta versão:
 import os
 import re
 import tempfile
+import zipfile
+from xml.etree import ElementTree as ET
 
 import docx
 import numpy as np
@@ -27,6 +29,17 @@ from docx.shared import Cm, Inches, Pt, RGBColor
 COLUNAS_ESPERADAS = ["Data", "Descrição", "Conta", "Categoria", "Tags", "Valor", "%", "Parcela", "Situação"]
 TAGS_GRAFICO = ["mauricio", "carol", "m&c"]
 TAGS_TOTAL_PARCELA = ["carol", "m&c"]
+TEMPLATE_PADRAO = "templates/FEV_2026_base.docx"
+PARTES_LAYOUT_RIGIDAS = [
+    "word/styles.xml",
+    "word/settings.xml",
+    "word/theme/theme1.xml",
+    "word/numbering.xml",
+]
+
+WML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+W_NS = {"w": WML_NS}
+W_VAL = f"{{{WML_NS}}}val"
 
 
 # --- Helpers para forçar larguras fixas no Word (tblGrid + tcW) ---
@@ -143,25 +156,172 @@ def set_cell_font(cell, text, bold=False, size=14, color=None, align="left"):
         run.font.color.rgb = color
 
 
+def _normalizar_caminho_abs(caminho):
+    return os.path.normcase(os.path.abspath(os.path.realpath(caminho)))
+
+
+def _resolver_caminho_template(caminho_template=None):
+    if caminho_template:
+        return _normalizar_caminho_abs(caminho_template)
+
+    base_script = os.path.dirname(os.path.abspath(__file__))
+    return _normalizar_caminho_abs(os.path.join(base_script, TEMPLATE_PADRAO))
+
+
+def _limpar_linhas_tabela_mantendo_cabecalho(table):
+    if len(table.rows) <= 1:
+        return
+
+    for row_idx in range(len(table.rows) - 1, 0, -1):
+        row = table.rows[row_idx]
+        row._tr.getparent().remove(row._tr)
+
+
+def _remover_paragrafo(paragraph):
+    parent = paragraph._element.getparent()
+    if parent is not None:
+        parent.remove(paragraph._element)
+
+
+def _limpar_blocos_grafico_existentes(doc):
+    texto_subtitulo = "Distribuição de despesas por categoria e pessoa"
+    for paragraph in list(doc.paragraphs)[::-1]:
+        tem_drawing = bool(paragraph._element.xpath(".//w:drawing"))
+        eh_subtitulo = paragraph.text.strip() == texto_subtitulo
+        if tem_drawing or eh_subtitulo:
+            _remover_paragrafo(paragraph)
+
+
+def _atributos_ordenados(elem):
+    if elem is None:
+        return None
+    return tuple(sorted((chave, valor) for chave, valor in elem.attrib.items()))
+
+
+def _coletar_invariantes_documento(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    body = root.find("w:body", W_NS)
+    if body is None:
+        raise RuntimeError("document.xml inválido: w:body ausente.")
+
+    sect_pr = body.find("w:sectPr", W_NS)
+    if sect_pr is None:
+        sect_pr = body.find(".//w:sectPr", W_NS)
+    if sect_pr is None:
+        raise RuntimeError("document.xml inválido: w:sectPr ausente.")
+
+    pg_sz = sect_pr.find("w:pgSz", W_NS)
+    pg_mar = sect_pr.find("w:pgMar", W_NS)
+
+    primeiro_paragrafo = body.find("w:p", W_NS)
+    if primeiro_paragrafo is None:
+        raise RuntimeError("document.xml inválido: primeiro parágrafo ausente.")
+    estilo_titulo = primeiro_paragrafo.find("w:pPr/w:pStyle", W_NS)
+    estilo_titulo_valor = estilo_titulo.attrib.get(W_VAL) if estilo_titulo is not None else None
+
+    primeira_tabela = body.find("w:tbl", W_NS)
+    if primeira_tabela is None:
+        raise RuntimeError("document.xml inválido: primeira tabela ausente.")
+    tbl_pr = primeira_tabela.find("w:tblPr", W_NS)
+    if tbl_pr is None:
+        raise RuntimeError("document.xml inválido: w:tblPr ausente na primeira tabela.")
+
+    tbl_style = tbl_pr.find("w:tblStyle", W_NS)
+    tbl_layout = tbl_pr.find("w:tblLayout", W_NS)
+    tbl_w = tbl_pr.find("w:tblW", W_NS)
+    tbl_ind = tbl_pr.find("w:tblInd", W_NS)
+    tbl_grid = primeira_tabela.find("w:tblGrid", W_NS)
+
+    grid_cols = []
+    if tbl_grid is not None:
+        grid_cols = [_atributos_ordenados(col) for col in tbl_grid.findall("w:gridCol", W_NS)]
+
+    return {
+        "section_pgSz": _atributos_ordenados(pg_sz),
+        "section_pgMar": _atributos_ordenados(pg_mar),
+        "titulo_pStyle": estilo_titulo_valor,
+        "tblStyle": _atributos_ordenados(tbl_style),
+        "tblLayout": _atributos_ordenados(tbl_layout),
+        "tblW": _atributos_ordenados(tbl_w),
+        "tblInd": _atributos_ordenados(tbl_ind),
+        "tblGridCols": tuple(grid_cols),
+    }
+
+
+def _normalizar_xml_canonico(xml_bytes):
+    try:
+        return ET.canonicalize(xml_bytes.decode("utf-8")).encode("utf-8")
+    except Exception:
+        try:
+            root = ET.fromstring(xml_bytes)
+            return ET.tostring(root, encoding="utf-8")
+        except Exception:
+            return xml_bytes
+
+
+def _validar_layout_rigido(caminho_template, caminho_gerado):
+    for parte in PARTES_LAYOUT_RIGIDAS:
+        try:
+            with zipfile.ZipFile(caminho_template, "r") as zip_template:
+                conteudo_template = zip_template.read(parte)
+        except KeyError as exc:
+            raise RuntimeError(f"Template inválido: parte ausente '{parte}'.") from exc
+
+        try:
+            with zipfile.ZipFile(caminho_gerado, "r") as zip_saida:
+                conteudo_saida = zip_saida.read(parte)
+        except KeyError as exc:
+            raise RuntimeError(f"Saída inválida: parte ausente '{parte}'.") from exc
+
+        if _normalizar_xml_canonico(conteudo_template) != _normalizar_xml_canonico(conteudo_saida):
+            raise RuntimeError(f"Validação rígida falhou: parte diferente '{parte}'.")
+
+    with zipfile.ZipFile(caminho_template, "r") as zip_template:
+        doc_template_xml = zip_template.read("word/document.xml")
+    with zipfile.ZipFile(caminho_gerado, "r") as zip_saida:
+        doc_saida_xml = zip_saida.read("word/document.xml")
+
+    inv_template = _coletar_invariantes_documento(doc_template_xml)
+    inv_saida = _coletar_invariantes_documento(doc_saida_xml)
+
+    divergencias = []
+    for chave in [
+        "section_pgSz",
+        "section_pgMar",
+        "titulo_pStyle",
+        "tblStyle",
+        "tblLayout",
+        "tblW",
+        "tblInd",
+        "tblGridCols",
+    ]:
+        if inv_template.get(chave) != inv_saida.get(chave):
+            divergencias.append(chave)
+
+    if divergencias:
+        lista = ", ".join(divergencias)
+        raise RuntimeError(
+            "Validação rígida falhou em invariantes de document.xml: "
+            f"{lista}."
+        )
+
+
 def _verificar_dependencia_excel(caminho_arquivo):
     extensao = os.path.splitext(caminho_arquivo)[1].lower()
     if extensao in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-        try:
-            import openpyxl  # noqa: F401
-        except Exception:
+        import importlib.util as _imp_util
+        if _imp_util.find_spec("openpyxl") is None:
             return "openpyxl"
     elif extensao == ".xls":
-        try:
-            import xlrd  # noqa: F401
-        except Exception:
+        import importlib.util as _imp_util
+        if _imp_util.find_spec("xlrd") is None:
             return "xlrd"
     return None
 
 
 def _verificar_dependencia_grafico():
-    try:
-        import matplotlib  # noqa: F401
-    except Exception:
+    import importlib.util as _imp_util
+    if _imp_util.find_spec("matplotlib") is None:
         return "matplotlib"
     return None
 
@@ -491,16 +651,28 @@ def selecionar_arquivo():
         return None
 
 
-def processar_e_gerar_docx(caminho_arquivo, verbose=False):
+def processar_e_gerar_docx(caminho_arquivo, verbose=False, caminho_template=None, validacao_layout="rigida"):
     """
     Executa leitura, cálculo e geração do relatório .docx.
 
     Args:
         caminho_arquivo (str): caminho do arquivo de entrada (.xlsx, .xls ou .csv).
         verbose (bool): ativa logs detalhados.
+        caminho_template (str | None): caminho do template .docx base de layout.
+        validacao_layout (str): "rigida" para validar invariantes de layout ou "off" para desativar.
     """
     if not os.path.exists(caminho_arquivo):
         print(f"ERRO: O arquivo '{caminho_arquivo}' não foi encontrado.")
+        return
+
+    modo_validacao = _limpar_texto(validacao_layout).lower() or "rigida"
+    if modo_validacao not in ("rigida", "off"):
+        print("ERRO: parâmetro validacao_layout inválido. Use 'rigida' ou 'off'.")
+        return
+
+    caminho_template_efetivo = _resolver_caminho_template(caminho_template)
+    if not os.path.exists(caminho_template_efetivo):
+        print(f"ERRO FATAL: template não encontrado em '{caminho_template_efetivo}'.")
         return
 
     dependencia_grafico = _verificar_dependencia_grafico()
@@ -648,53 +820,44 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
         f"soma Parcela(carol+m&c)={_formatar_numero_br(soma_parcela_especifica)}."
     )
 
-    doc = docx.Document()
-
-    section = doc.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-    section.top_margin = Inches(0.5)
-    section.bottom_margin = Inches(0.5)
-    section.left_margin = Inches(0.5)
-    section.right_margin = Inches(0.5)
-
-    doc.add_heading(titulo_relatorio, level=1)
-    doc.add_paragraph()
-
-    larguras_fixas_cm = {
-        "Data": 3.1,
-        "Descrição": 6.2,
-        "Conta": 2.0,
-        "Categoria": 3.5,
-        "Tags": 2.3,
-        "Valor": 3.0,
-        "%": 1.5,
-        "Parcela": 2.6,
-        "Situação": 2.4,
-    }
-
-    table = doc.add_table(rows=1, cols=len(df_final.columns))
-    table.style = "Table Grid"
-
     try:
-        table.autofit = False
-        table.allow_autofit = False
-    except Exception:
-        table.autofit = False
+        doc = docx.Document(caminho_template_efetivo)
+    except Exception as exc:
+        print(f"ERRO FATAL ao abrir template '{caminho_template_efetivo}': {exc}")
+        return
 
-    _set_table_layout_fixed(table)
-    _apply_table_grid(table, list(df_final.columns), larguras_fixas_cm)
+    if not doc.paragraphs:
+        print("ERRO FATAL: template inválido, não há parágrafos para o título.")
+        return
+
+    doc.paragraphs[0].text = titulo_relatorio
+
+    if not doc.tables:
+        print("ERRO FATAL: template inválido, não há tabela principal.")
+        return
+
+    table = doc.tables[0]
+    if len(table.rows) == 0:
+        print("ERRO FATAL: template inválido, tabela principal sem cabeçalho.")
+        return
+
+    _limpar_linhas_tabela_mantendo_cabecalho(table)
 
     hdr_cells = table.rows[0].cells
+    if len(hdr_cells) != len(df_final.columns):
+        print(
+            "ERRO FATAL: template incompatível. "
+            f"Tabela possui {len(hdr_cells)} colunas, esperado {len(df_final.columns)}."
+        )
+        return
+
     for i, col_name in enumerate(df_final.columns):
-        _set_cell_width(hdr_cells[i], larguras_fixas_cm.get(col_name, 2.0))
         set_cell_font(hdr_cells[i], col_name, bold=True, align="center")
 
     for _, row in df_final.iterrows():
         row_cells = table.add_row().cells
 
         for i, col_name in enumerate(df_final.columns):
-            _set_cell_width(row_cells[i], larguras_fixas_cm.get(col_name, 2.0))
             font_color = None
             alinhamento = "justify"
 
@@ -722,8 +885,6 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
             set_cell_font(row_cells[i], texto_formatado, color=font_color, align=alinhamento)
 
     total_cells = table.add_row().cells
-    for i, col_name in enumerate(df_final.columns):
-        _set_cell_width(total_cells[i], larguras_fixas_cm.get(col_name, 2.0))
 
     valor_col_index = list(df_final.columns).index("Valor")
     parcela_col_index = list(df_final.columns).index("Parcela")
@@ -744,8 +905,9 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
         align="right",
     )
 
+    _limpar_blocos_grafico_existentes(doc)
     doc.add_paragraph()
-    subtitulo = doc.add_paragraph("Distribuição de despesas por categoria e pessoa")
+    subtitulo = doc.add_paragraph("Distribuição de despesas por categoria e pessoa - próxima página")
     subtitulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     caminho_grafico_tmp = None
@@ -772,9 +934,20 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
     pasta_saida = os.path.dirname(caminho_arquivo)
     caminho_saida = os.path.join(pasta_saida, f"{nome_saida}.docx")
     caminho_tmp_docx = f"{caminho_saida}.tmp"
+    if _normalizar_caminho_abs(caminho_saida) == _normalizar_caminho_abs(caminho_template_efetivo):
+        print(
+            "ERRO FATAL: o caminho de saída coincide com o template base. "
+            "Altere o nome/local do arquivo de entrada ou informe outro template."
+        )
+        if caminho_grafico_tmp and os.path.exists(caminho_grafico_tmp):
+            os.remove(caminho_grafico_tmp)
+        return
 
     try:
         doc.save(caminho_tmp_docx)
+        if modo_validacao == "rigida":
+            _validar_layout_rigido(caminho_template_efetivo, caminho_tmp_docx)
+            print("Validação rígida de layout concluída com sucesso.")
         try:
             if os.path.exists(caminho_saida):
                 os.remove(caminho_saida)
@@ -782,6 +955,12 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
             pass
         os.replace(caminho_tmp_docx, caminho_saida)
         print(f"Arquivo Word gerado com sucesso: {caminho_saida}")
+
+    except Exception as exc:
+        print(f"ERRO FATAL ao salvar/validar o documento: {exc}")
+        if os.path.exists(caminho_tmp_docx):
+            os.remove(caminho_tmp_docx)
+        return
 
     finally:
         if caminho_grafico_tmp and os.path.exists(caminho_grafico_tmp):
