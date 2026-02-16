@@ -66,8 +66,46 @@ if missing_opcionais:
     print(f"{C.YELLOW}Para habilitar a classificação por IA: python -m pip install {' '.join(missing_opcionais)}{C.END}")
 
 
+def _ler_primeira_linha(path: Path) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for linha in f:
+                valor = linha.strip()
+                if valor and not valor.startswith("#"):
+                    if "=" in valor:
+                        chave, possivel_valor = valor.split("=", 1)
+                        if chave.strip().upper() in {"OPENAI_API_KEY", "API_KEY"}:
+                            valor = possivel_valor.strip()
+                    valor = valor.strip("'\"")
+                    return valor
+    except Exception:
+        return None
+    return None
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+def _carregar_openai_api_key() -> Optional[str]:
+    key_env = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if key_env:
+        return key_env
+
+    arquivos_candidatos = [
+        Path.cwd() / "OPENAI_API_KEY.txt",
+        Path.cwd() / "CHAVE_SECRETA_API_Mauricio_local.txt",
+        Path.cwd() / ".openai_api_key",
+        Path.home() / ".openai_api_key",
+    ]
+    for arquivo in arquivos_candidatos:
+        if not arquivo.exists():
+            continue
+        key_arquivo = _ler_primeira_linha(arquivo)
+        if key_arquivo:
+            print(f"{C.GREEN}✓ OPENAI_API_KEY carregada de {arquivo.name}.{C.END}")
+            return key_arquivo
+
+    return None
+
+
+OPENAI_API_KEY = _carregar_openai_api_key()
 PDF_PASSWORD = "02533"
 
 MESES_SIGLA_PT = {
@@ -163,7 +201,7 @@ async def processar_categorias_em_lote(transacoes_por_cartao: Dict[str, List[Dic
         return
     if not OPENAI_API_KEY:
         print(f"\n{C.RED}{C.BOLD}ERRO CRÍTICO: A variável OPENAI_API_KEY não foi configurada.{C.END}")
-        print(f"{C.YELLOW}Defina OPENAI_API_KEY no ambiente antes de executar este script.{C.END}")
+        print(f"{C.YELLOW}Defina OPENAI_API_KEY no ambiente ou preencha o arquivo CHAVE_SECRETA_API_Mauricio_local.txt.{C.END}")
         return
 
     cliente_openai = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
