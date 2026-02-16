@@ -242,6 +242,25 @@ def _filtrar_linhas_nao_transacao(df):
     }
 
 
+def _extrair_total_linha_total(df_original):
+    if df_original is None:
+        return None
+
+    if "Data" not in df_original.columns or "Valor" not in df_original.columns:
+        return None
+
+    data_str = df_original["Data"].astype(str).str.strip().str.lower()
+    mask_total = data_str.str.startswith("total")
+    if not mask_total.any():
+        return None
+
+    valores_total = pd.to_numeric(df_original.loc[mask_total, "Valor"], errors="coerce").dropna()
+    if valores_total.empty:
+        return None
+
+    return float(valores_total.iloc[-1])
+
+
 def _ajustar_luminosidade(rgb, fator):
     if fator < 1:
         return tuple(max(0.0, min(1.0, c * fator)) for c in rgb)
@@ -250,73 +269,141 @@ def _ajustar_luminosidade(rgb, fator):
     return tuple(max(0.0, min(1.0, c + (1 - c) * ganho)) for c in rgb)
 
 
-def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png):
+def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png, total_referencia=None):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgb
     from matplotlib.patches import Patch
 
     df_chart = df_processado.copy()
     df_chart["Tags"] = df_chart["Tags"].apply(_normalizar_tag)
     df_chart["Categoria"] = df_chart["Categoria"].apply(_limpar_texto)
+    df_chart["Valor"] = pd.to_numeric(df_chart["Valor"], errors="coerce")
 
     df_chart = df_chart[df_chart["Tags"].isin(TAGS_GRAFICO)].copy()
     df_chart = df_chart[df_chart["Categoria"] != ""].copy()
-    df_chart["metric"] = df_chart["Parcela"].abs()
+    df_chart = df_chart[df_chart["Valor"].notna()].copy()
+    df_chart["metric"] = df_chart["Valor"].abs()
     df_chart = df_chart[df_chart["metric"] > 0].copy()
 
     if df_chart.empty:
         raise RuntimeError("ERRO FATAL: não há dados válidos para gerar o gráfico donut.")
 
-    inner = df_chart.groupby("Categoria", as_index=True)["metric"].sum().sort_values(ascending=False)
-    outer = df_chart.groupby(["Categoria", "Tags"], as_index=True)["metric"].sum()
+    limite_outros = 500.0
+    totais_categoria_original = df_chart.groupby("Categoria", as_index=True)["metric"].sum()
+    categorias_para_outros = totais_categoria_original[totais_categoria_original < limite_outros].index.tolist()
+    if categorias_para_outros:
+        df_chart["Categoria_Ajustada"] = df_chart["Categoria"].where(
+            ~df_chart["Categoria"].isin(categorias_para_outros),
+            "outros",
+        )
+    else:
+        df_chart["Categoria_Ajustada"] = df_chart["Categoria"]
 
-    categorias = inner.index.tolist()
+    totais_categoria = (
+        df_chart.groupby("Categoria_Ajustada", as_index=True)["metric"].sum().sort_values(ascending=False)
+    )
+    if "outros" in totais_categoria.index and len(totais_categoria.index) > 1:
+        valor_outros = float(totais_categoria.loc["outros"])
+        totais_categoria = totais_categoria.drop(index="outros")
+        totais_categoria.loc["outros"] = valor_outros
+
+    subdivisoes = df_chart.groupby(["Categoria_Ajustada", "Tags"], as_index=True)["metric"].sum()
+
+    categorias = totais_categoria.index.tolist()
+    # Paleta de alto contraste para diferenciar melhor as categorias.
+    paleta_contraste = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+        "#393b79",
+        "#637939",
+        "#8c6d31",
+        "#843c39",
+        "#7b4173",
+    ]
     mapa_cor_base = {}
-    cmap = plt.get_cmap("tab20")
-    for indice, categoria in enumerate(categorias):
-        mapa_cor_base[categoria] = cmap(indice % cmap.N)[:3]
+    indice_paleta = 0
+    for categoria in categorias:
+        if categoria == "outros":
+            mapa_cor_base[categoria] = to_rgb("#9e9e9e")
+        else:
+            mapa_cor_base[categoria] = to_rgb(paleta_contraste[indice_paleta % len(paleta_contraste)])
+            indice_paleta += 1
 
-    inner_valores = inner.values.tolist()
-    inner_cores = [mapa_cor_base[categoria] for categoria in categorias]
+    categoria_valores = totais_categoria.values.tolist()
+    categoria_cores = [mapa_cor_base[categoria] for categoria in categorias]
 
-    fatores_tag = {"mauricio": 0.72, "carol": 1.0, "m&c": 1.28}
-    outer_valores = []
-    outer_cores = []
+    estilos_tag = {
+        "m&c": {"fator": 0.72, "hatch": "///", "edge_factor": 0.75, "linewidth": 1.0},
+        "carol": {"fator": 1.00, "hatch": "", "edge_factor": 0.75, "linewidth": 1.0},
+        "mauricio": {"fator": 1.22, "hatch": "..", "edge_factor": 0.75, "linewidth": 1.0},
+    }
+    ordem_tags_tom = ["m&c", "carol", "mauricio"]
+    subdiv_valores = []
+    subdiv_cores = []
+    subdiv_estilos = []
     for categoria in categorias:
         cor_base = mapa_cor_base[categoria]
-        for tag in TAGS_GRAFICO:
-            valor = float(outer.get((categoria, tag), 0.0))
+        if categoria == "outros":
+            valor_outros = float(totais_categoria.loc[categoria])
+            if valor_outros > 0:
+                subdiv_valores.append(valor_outros)
+                subdiv_cores.append(cor_base)
+                subdiv_estilos.append({"hatch": "", "edge_factor": 0.82, "linewidth": 1.0})
+            continue
+
+        for tag in ordem_tags_tom:
+            valor = float(subdivisoes.get((categoria, tag), 0.0))
             if valor <= 0:
                 continue
-            outer_valores.append(valor)
-            outer_cores.append(_ajustar_luminosidade(cor_base, fatores_tag[tag]))
+            estilo = estilos_tag[tag]
+            subdiv_valores.append(valor)
+            subdiv_cores.append(_ajustar_luminosidade(cor_base, estilo["fator"]))
+            subdiv_estilos.append(estilo)
 
-    if not outer_valores:
+    if not subdiv_valores:
         raise RuntimeError("ERRO FATAL: não foi possível montar as subdivisões do gráfico donut.")
 
-    fig, ax = plt.subplots(figsize=(12, 7.2), dpi=180)
+    fig, ax = plt.subplots(figsize=(14, 8), dpi=180)
+
+    wedges_inner, _ = ax.pie(
+        subdiv_valores,
+        radius=1.0,
+        colors=subdiv_cores,
+        startangle=90,
+        counterclock=False,
+        wedgeprops={"width": 0.30, "edgecolor": "white", "linewidth": 0.8},
+    )
+    for wedge, cor_atual, estilo in zip(wedges_inner, subdiv_cores, subdiv_estilos):
+        if estilo["hatch"]:
+            wedge.set_hatch(estilo["hatch"])
+        wedge.set_edgecolor(_ajustar_luminosidade(cor_atual, estilo["edge_factor"]))
+        wedge.set_linewidth(estilo["linewidth"])
 
     ax.pie(
-        inner_valores,
-        radius=1.0,
-        colors=inner_cores,
+        categoria_valores,
+        radius=1.34,
+        colors=categoria_cores,
         startangle=90,
         counterclock=False,
         wedgeprops={"width": 0.34, "edgecolor": "white", "linewidth": 1.2},
     )
 
-    ax.pie(
-        outer_valores,
-        radius=1.34,
-        colors=outer_cores,
-        startangle=90,
-        counterclock=False,
-        wedgeprops={"width": 0.30, "edgecolor": "white", "linewidth": 0.8},
-    )
+    if _is_number(total_referencia):
+        total = abs(float(total_referencia))
+    else:
+        total = abs(float(pd.to_numeric(df_processado["Valor"], errors="coerce").dropna().sum()))
 
-    total = float(sum(inner_valores))
     ax.text(
         0,
         0,
@@ -328,25 +415,41 @@ def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png):
     )
 
     legenda_categoria = [
-        Patch(facecolor=inner_cores[i], label=f"{cat} (R$ {_formatar_numero_br(inner_valores[i])})")
+        Patch(facecolor=categoria_cores[i], label=f"{cat} (R$ {_formatar_numero_br(categoria_valores[i])})")
         for i, cat in enumerate(categorias)
     ]
+    cor_exemplo_tom = to_rgb("#4e79a7")
     legenda_tag = [
-        Patch(facecolor=(0.35, 0.35, 0.35), label="mauricio (tom escuro)"),
-        Patch(facecolor=(0.6, 0.6, 0.6), label="carol (tom base)"),
-        Patch(facecolor=(0.85, 0.85, 0.85), label="m&c (tom claro)"),
+        Patch(
+            facecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["m&c"]["fator"]),
+            edgecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["m&c"]["edge_factor"]),
+            hatch=estilos_tag["m&c"]["hatch"],
+            label="m&c (tom escuro)",
+        ),
+        Patch(
+            facecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["carol"]["fator"]),
+            edgecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["carol"]["edge_factor"]),
+            label="carol (tom base)",
+        ),
+        Patch(
+            facecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["mauricio"]["fator"]),
+            edgecolor=_ajustar_luminosidade(cor_exemplo_tom, estilos_tag["mauricio"]["edge_factor"]),
+            hatch=estilos_tag["mauricio"]["hatch"],
+            label="mauricio (tom claro)",
+        ),
     ]
 
-    legenda_1 = ax.legend(
+    legenda_categoria_artist = ax.legend(
         handles=legenda_categoria,
         title="Categorias",
         loc="center left",
-        bbox_to_anchor=(1.02, 0.50),
-        fontsize=9,
-        title_fontsize=10,
+        bbox_to_anchor=(1.028, 0.50),
+        fontsize=8,
+        title_fontsize=9,
         frameon=False,
+        borderaxespad=0.12,
     )
-    ax.add_artist(legenda_1)
+    ax.add_artist(legenda_categoria_artist)
 
     ax.legend(
         handles=legenda_tag,
@@ -359,8 +462,8 @@ def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png):
         frameon=False,
     )
 
-    ax.set_title("Distribuição de despesas por categoria e pessoa (base: abs(Parcela))", fontsize=12)
-    fig.subplots_adjust(left=0.04, right=0.78, top=0.90, bottom=0.14)
+    ax.set_title("Distribuição de despesas por categoria e pessoa", fontsize=13, pad=30)
+    fig.subplots_adjust(left=0.03, right=0.60, top=0.82, bottom=0.20)
     fig.savefig(caminho_png, dpi=220, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -424,6 +527,12 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
         else:
             df, aba_origem, abas_disponiveis = _ler_dataframe_excel_segunda_aba(caminho_arquivo)
             print(f"Aba utilizada (índice 1): '{aba_origem}'. Abas disponíveis: {abas_disponiveis}")
+
+        total_referencia_planilha = _extrair_total_linha_total(df)
+        if total_referencia_planilha is not None:
+            print(f"Total de referência detectado na linha de total: {_formatar_numero_br(abs(total_referencia_planilha))}.")
+        else:
+            print("Linha de total não encontrada (ou inválida). Total do gráfico usará fallback pela soma de Valor.")
 
         for col in COLUNAS_ESPERADAS:
             if col not in df.columns:
@@ -607,6 +716,9 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
                 if col_name == "Tags":
                     alinhamento = "center"
 
+            if col_name in ("Conta", "%"):
+                alinhamento = "center"
+
             set_cell_font(row_cells[i], texto_formatado, color=font_color, align=alinhamento)
 
     total_cells = table.add_row().cells
@@ -641,7 +753,11 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False):
         with tempfile.NamedTemporaryFile(prefix="grafico_donut_", suffix=".png", delete=False) as arquivo_tmp:
             caminho_grafico_tmp = arquivo_tmp.name
 
-        _gerar_grafico_donut_categoria_tag(df, caminho_grafico_tmp)
+        _gerar_grafico_donut_categoria_tag(
+            df,
+            caminho_grafico_tmp,
+            total_referencia=total_referencia_planilha,
+        )
         doc.add_picture(caminho_grafico_tmp, width=Cm(20))
         doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
         print("Gráfico donut gerado e inserido no documento.")
