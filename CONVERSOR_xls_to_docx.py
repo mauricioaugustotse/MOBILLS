@@ -604,8 +604,8 @@ def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png, total_referen
         title="Categorias",
         loc="center left",
         bbox_to_anchor=(1.028, 0.50),
-        fontsize=8,
-        title_fontsize=9,
+        fontsize=13,
+        title_fontsize=14,
         frameon=False,
         borderaxespad=0.12,
     )
@@ -617,8 +617,8 @@ def _gerar_grafico_donut_categoria_tag(df_processado, caminho_png, total_referen
         loc="upper center",
         bbox_to_anchor=(0.5, -0.05),
         ncol=3,
-        fontsize=9,
-        title_fontsize=10,
+        fontsize=13,
+        title_fontsize=14,
         frameon=False,
     )
 
@@ -681,6 +681,7 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False, caminho_template=None
             "ERRO FATAL ao gerar relatório: "
             f"Dependência '{dependencia_grafico}' não instalada. "
             f"Instale com: pip install {dependencia_grafico}"
+            
         )
         return
 
@@ -909,6 +910,8 @@ def processar_e_gerar_docx(caminho_arquivo, verbose=False, caminho_template=None
     doc.add_paragraph()
     subtitulo = doc.add_paragraph("Distribuição de despesas por categoria e pessoa - próxima página")
     subtitulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if subtitulo.runs:
+        subtitulo.runs[0].font.size = Pt(20)
 
     caminho_grafico_tmp = None
     try:
