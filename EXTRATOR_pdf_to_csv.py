@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
+import builtins
 import re
 import csv
 import os
 import asyncio
+import sys
 import traceback
 import unicodedata
 from pathlib import Path
@@ -21,6 +23,25 @@ class C:
     END = '\033[0m'
     BOLD = '\033[1m'
 # --------------------------------------------------------------------
+
+
+def print(*args, sep=" ", end="\n", file=None, flush=False):
+    destino = file or sys.stdout
+    encoding = getattr(destino, "encoding", None)
+    if not encoding:
+        builtins.print(*args, sep=sep, end=end, file=destino, flush=flush)
+        return
+
+    safe_args = []
+    for arg in args:
+        texto = str(arg)
+        try:
+            texto.encode(encoding)
+        except UnicodeEncodeError:
+            texto = texto.encode(encoding, errors="replace").decode(encoding)
+        safe_args.append(texto)
+
+    builtins.print(*safe_args, sep=sep, end=end, file=destino, flush=flush)
 
 fitz = None
 openai = None
@@ -164,7 +185,6 @@ async def classificar_transacao(transacao: Dict[str, Any], cliente: Any) -> str:
     Responda APENAS com o nome exato da categoria.
 
     Categorias Válidas: {', '.join(CATEGORIAS_PERMITIDAS)}
-
     Descrição da Despesa: "{descricao}"
 
     Categoria:

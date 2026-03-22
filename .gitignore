@@ -11,3 +11,4 @@ Chave_API_Perplexity.txt
 __pycache__/
 .vscode/
 .venv/
+.venv-win/
