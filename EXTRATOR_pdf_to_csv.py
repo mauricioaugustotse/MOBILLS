@@ -569,12 +569,18 @@ def parsear_transacoes(pdf_path: Path, mes_venc: int, ano_venc: int) -> Dict[str
             for page in doc:
                 texto_pagina = _normalizar_hifens(page.get_text("text"))
 
+                tx_matches = list(pat_tx.finditer(texto_pagina))
+                tx_spans = [(m.start(), m.end()) for m in tx_matches]
+
+                def marker_embutido_em_transacao(pos: int) -> bool:
+                    return any(inicio <= pos < fim for inicio, fim in tx_spans)
+
                 tokens = []
                 tokens += [('card', m.start(), m.group(1), m) for m in pat_card.finditer(texto_pagina)]
-                tokens += [('tx',   m.start(), m, m) for m in pat_tx.finditer(texto_pagina)]
-                tokens += [('mkp',  m.start(), m.group(1), m) for m in pat_mk_parc.finditer(texto_pagina)]
-                tokens += [('mkv',  m.start(), None, m) for m in pat_mk_vista.finditer(texto_pagina)]
-                tokens += [('mki',  m.start(), None, m) for m in pat_mk_ignore.finditer(texto_pagina)]
+                tokens += [('tx',   m.start(), m, m) for m in tx_matches]
+                tokens += [('mkp',  m.start(), m.group(1), m) for m in pat_mk_parc.finditer(texto_pagina) if not marker_embutido_em_transacao(m.start())]
+                tokens += [('mkv',  m.start(), None, m) for m in pat_mk_vista.finditer(texto_pagina) if not marker_embutido_em_transacao(m.start())]
+                tokens += [('mki',  m.start(), None, m) for m in pat_mk_ignore.finditer(texto_pagina) if not marker_embutido_em_transacao(m.start())]
                 tokens.sort(key=lambda x: x[1])
 
                 current_card = current_card_global
@@ -585,12 +591,18 @@ def parsear_transacoes(pdf_path: Path, mes_venc: int, ano_venc: int) -> Dict[str
 
                 for typ, pos, content, mobj in tokens:
                     if typ == 'card':
+                        pendentes_idx.clear()
+                        queue_markers.clear()
                         current_card = content
                         current_card_global = content
                         continue
 
                     if typ == 'tx':
                         data_str, desc_raw, valor_raw, sinal = mobj.groups()
+                        if not current_card:
+                            transacoes_sem_cartao += 1
+                            continue
+
                         dia_str, mes_str = data_str.split('/')
                         ano_tx = inferir_ano(int(mes_str))
 
@@ -606,6 +618,11 @@ def parsear_transacoes(pdf_path: Path, mes_venc: int, ano_venc: int) -> Dict[str
                         # Captura fração inline "PARC.x/y" antes da limpeza
                         m_local_frac = re.search(r'\bPARC\.?\s*(\d{1,2}\s*/\s*\d{1,2})\b', desc_raw, flags=re.IGNORECASE)
                         local_frac = re.sub(r'\s+', '', m_local_frac.group(1)) if m_local_frac else None
+                        tem_metadado_inline = bool(
+                            local_frac
+                            or pat_mk_vista.search(desc_raw)
+                            or pat_mk_ignore.search(desc_raw)
+                        )
                         descricao_base = _limpar_descricao(desc_raw)
 
                         item = {
@@ -615,12 +632,20 @@ def parsear_transacoes(pdf_path: Path, mes_venc: int, ano_venc: int) -> Dict[str
                             "conta": "BRB",
                             "categoria": "A classificar",
                             "_card": current_card,
+                            "_local_frac": local_frac,
                         }
                         idx = len(pagina_transacoes)
                         pagina_transacoes.append(item)
 
                         # Se há metadados enfileirados (vieram antes), consome 1 para esta linha
-                        if queue_markers:
+                        if local_frac:
+                            atribuicoes[idx] = local_frac
+                            if queue_markers:
+                                queue_markers.popleft()
+                        elif tem_metadado_inline:
+                            if queue_markers:
+                                queue_markers.popleft()
+                        elif queue_markers:
                             mk_typ, mk_frac = queue_markers.popleft()
                             atribuicoes[idx] = (re.sub(r'\s+', '', mk_frac) if mk_frac else None) if mk_typ == 'mkp' else None
                         else:
@@ -638,12 +663,10 @@ def parsear_transacoes(pdf_path: Path, mes_venc: int, ano_venc: int) -> Dict[str
 
                 # aplica as frações atribuídas
                 for i, tx in enumerate(pagina_transacoes):
-                    frac = atribuicoes.get(i, None)
-                    # aplica fração vinda do metadado e/ou a fração inline (PARC.x/y)
+                    frac = tx.pop("_local_frac", None) or atribuicoes.get(i, None)
+                    # aplica a fração inline da própria linha ou a fração vinda de metadado separado
                     if frac:
                         tx['descricao'] = _append_frac(tx['descricao'], frac)
-                    if 'local_frac' in locals() and local_frac:
-                        tx['descricao'] = _append_frac(tx['descricao'], local_frac)
 
                     card_key = tx.pop("_card", None)
                     if not card_key:
